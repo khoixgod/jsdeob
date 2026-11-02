@@ -46,7 +46,9 @@ Each round runs these passes in order, until a round changes nothing:
 4. `inlineProxyObjects` inlines lookup objects such as `{ abc: "str", xyz: function (a, b) { return a + b; } }`. A function is inlined only if each parameter appears exactly once and in argument order, so side-effect order is preserved. An object that is ever written to is skipped.
 5. `removeUnreachable` and `removeDeadBindings` delete code after `return`/`throw` and unused side-effect-free bindings.
 
-Afterwards it splits sequence expressions and multi-declarations, converts `a["b"]` to `a.b` and hex literals to decimal, and renames `_0x…` and 1–2 character local names by role (`index`, `acc`, `item`, `arr`, `str`, …).
+Afterwards it splits sequence expressions and multi-declarations, converts `a["b"]` to `a.b` and hex literals to decimal, and renames obfuscated local names by role (`index`, `acc`, `item`, `arr`, `str`, …). Obfuscated names are `_0x…` names, names of 1–2 characters, and the Arabic/Chinese dictionary names that `identifiersDictionary` produces (`عيادةغايةمنشارريم`, `涉及锁孔繁荣昌盛`).
+
+Unreachable code goes away even when the exit is hidden in a nested block or an `if`/`else` that returns on both branches; the obfuscator puts its junk code behind those. Hoisted `var`s after an exit keep their declaration and lose their initializer, which never runs.
 
 Script top-level names that look human-written are never deleted or renamed, because another script on the page may use them. In ES modules, top-level names are private unless exported.
 
@@ -69,6 +71,6 @@ devirt evaluates whole programs down to their output (`console.log(7714)`). jsde
 
 - No switch-dispatcher control-flow unflattening (`while(true){switch(order[i++]){…}}`). The corpus contains none.
 - Proxy functions with repeated or reordered parameters stay as method calls.
-- A string group whose array is read by anything other than its decoders and rotation loop is skipped. Decoding it before an unrecognized rotation would produce garbage.
+- A string group whose array is read by anything other than its decoders, its rotation loop and aliases of the decoder (`const a = D`, or `var a; … (a = D)(…)` with a single assignment) is skipped. Decoding it before an unrecognized rotation would produce garbage.
 - `selfDefending` and `disableConsoleOutput` wrappers are kept. They change runtime behavior, so removing them would change what the program does.
 - The renamer works from roles, not meaning. Names like `value3` are left where it cannot infer a role.

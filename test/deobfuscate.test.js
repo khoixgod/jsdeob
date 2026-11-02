@@ -50,6 +50,19 @@ console.log(f());`;
   assert.deepEqual(await sandbox.run(await run(input)), ["1"]);
 });
 
+test("dictionary junk identifiers are renamed and dead branches after return dropped", async () => {
+  const input = `function f(a) {
+  try { return a.x; } catch (焦点葡牡) { return 焦点葡牡.message; }
+  { return 1; }
+  عيادةغايةمنشارريم = 涉及锁孔繁荣昌盛[1];
+  var مروءة = 惨无人道虎头蛇尾(1);
+}
+console.log(f(null), f({ x: 2 }));`;
+  const out = await run(input);
+  assert.deepEqual(await sandbox.run(out), await sandbox.run(input));
+  assert.doesNotMatch(out, /[\u0600-\u06ff\u4e00-\u9fff]/);
+});
+
 test("a decoder call that throws is left in place with its machinery", async () => {
   const input = `function _0xa() { const k = ["log"]; _0xa = function () { return k; }; return _0xa(); }
 function _0xb(i) { i = i - 0; if (i > 5) throw new Error("x"); return _0xa()[i]; }

@@ -159,14 +159,22 @@ const insideAny = (path, containers) => containers.some((c) => path === c || pat
  * The returned node is a fresh tree; the input is not mutated.
  */
 function resolveCall(node, scope, decoders, depth) {
+  // `(alias = D)(…)` calls D. Replacing the call drops the assignment, so only do it when
+  // nothing ever reads the alias.
+  if (t.isAssignmentExpression(node.callee, { operator: "=" }) && t.isIdentifier(node.callee.left) && t.isIdentifier(node.callee.right)) {
+    const alias = scope.getBinding(node.callee.left.name);
+    if (!alias || alias.referencePaths.length > 0) return null;
+    return resolveCall(t.callExpression(node.callee.right, node.arguments), scope, decoders, depth + 1);
+  }
   if (depth > 20 || !t.isIdentifier(node.callee)) return null;
   if (!node.arguments.every((a) => isConstExpr(a))) return null;
   const binding = scope.getBinding(node.callee.name);
-  if (!binding || !binding.constant) return null;
-  if (decoders.has(binding)) return t.callExpression(t.identifier(binding.identifier.name), node.arguments.map((a) => t.cloneNode(a, true)));
+  if (!binding) return null;
+  if (decoders.has(binding) && binding.constant) return t.callExpression(t.identifier(binding.identifier.name), node.arguments.map((a) => t.cloneNode(a, true)));
 
   const target = aliasTarget(binding);
   if (target) return resolveCall(t.callExpression(t.identifier(target.name), node.arguments), binding.path.scope, decoders, depth + 1);
+  if (!binding.constant) return null;
 
   const wrapper = wrapperFunction(binding);
   if (!wrapper) return null;
@@ -179,10 +187,16 @@ function resolveCall(node, scope, decoders, depth) {
   return resolveCall(inner, wrapper.scope, decoders, depth + 1);
 }
 
-/** `const x = D` → the Identifier D. */
+/**
+ * `const x = D` → the Identifier D. Also the minified `var x; … (x = D)(…)`: a declaration with
+ * no initializer and exactly one plain assignment of an identifier, which must be a decoder.
+ */
 function aliasTarget(binding) {
   const p = binding.path;
-  return p.isVariableDeclarator() && t.isIdentifier(p.node.init) ? p.node.init : null;
+  if (binding.constant) return p.isVariableDeclarator() && t.isIdentifier(p.node.init) ? p.node.init : null;
+  if (!p.isVariableDeclarator() || p.node.init || binding.constantViolations.length !== 1) return null;
+  const v = binding.constantViolations[0];
+  return v.isAssignmentExpression({ operator: "=" }) && t.isIdentifier(v.node.right) ? v.node.right : null;
 }
 
 /** `function w(a, b) { return D(a - 1, b); }` (or the same as a const function expression). */

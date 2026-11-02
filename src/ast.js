@@ -32,7 +32,12 @@ export function programPath(ast) {
 }
 
 const OPAQUE = /^_0x[0-9a-f]+$/i;
-export const isObfuscatorName = (name) => OPAQUE.test(name);
+// javascript-obfuscator's `identifiersDictionary` builds names by gluing dictionary words, often
+// Arabic or Chinese (`عيادةغايةمنشارريم`, `涉及锁孔繁荣昌盛`). A binding name made only of these
+// scripts is renamed: the role-based replacement is readable either way, so a false positive
+// costs nothing but the original spelling.
+const DICTIONARY = /^[\u0600-\u06ff\u0750-\u077f\u3400-\u4dbf\u4e00-\u9fff]{2,}$/u;
+export const isObfuscatorName = (name) => OPAQUE.test(name) || DICTIONARY.test(name);
 
 /** Calls `fn(scope)` for the program scope and every nested scope. `traverse({Scope})` skips the program. */
 export function forEachScope(program, fn) {

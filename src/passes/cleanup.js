@@ -69,16 +69,29 @@ function removeAssignment(p) {
   if (!p.removed) p.parentPath.remove();
 }
 
-/** Drops unreachable code after return/throw/break/continue and empty statements. */
+/**
+ * Drops unreachable code after a statement that always exits: return/throw/break/continue,
+ * a nested block that always exits, or an if/else whose branches both exit. The obfuscator
+ * hides junk code (random Arabic/Chinese identifiers) behind exactly these shapes.
+ */
 export function removeUnreachable(program) {
   let changed = false;
   program.traverse({
     "BlockStatement|Program"(path) {
       const body = path.get("body");
-      const end = body.findIndex((s) => s.isReturnStatement() || s.isThrowStatement() || s.isBreakStatement() || s.isContinueStatement());
+      const end = body.findIndex((s) => alwaysExits(s.node));
       if (end === -1) return;
       for (const s of body.slice(end + 1)) {
-        if (s.isFunctionDeclaration() || (s.isVariableDeclaration({ kind: "var" }))) continue;
+        if (s.isFunctionDeclaration()) continue;
+        if (s.isVariableDeclaration({ kind: "var" })) {
+          // The binding is hoisted and may be referenced earlier, but the initializer never runs.
+          for (const d of s.node.declarations) {
+            if (!d.init) continue;
+            d.init = null;
+            changed = true;
+          }
+          continue;
+        }
         s.remove();
         changed = true;
       }
@@ -91,6 +104,13 @@ export function removeUnreachable(program) {
     },
   });
   return changed;
+}
+
+function alwaysExits(node) {
+  if (t.isReturnStatement(node) || t.isThrowStatement(node) || t.isBreakStatement(node) || t.isContinueStatement(node)) return true;
+  if (t.isBlockStatement(node)) return node.body.some(alwaysExits);
+  if (t.isIfStatement(node)) return Boolean(node.alternate) && alwaysExits(node.consequent) && alwaysExits(node.alternate);
+  return false;
 }
 
 /** `a["b"]` → `a.b`, `{ "b": 1 }` → `{ b: 1 }`, `!0`/`!1`/`!![]`/`![]` → booleans, `void 0` → undefined. */
