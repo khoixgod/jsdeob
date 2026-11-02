@@ -13,6 +13,13 @@ export function generate(node) {
   return babelGenerate(node, { jsescOption: { minimal: true, quotes: "double" } }).code;
 }
 
+/**
+ * Code for the sandbox. Compact like the obfuscator's own output: "self-defending" decoders
+ * regex-test their source text and loop forever when it has been reformatted.
+ */
+export function generateCompact(node) {
+  return babelGenerate(node, { compact: true, jsescOption: { minimal: true } }).code;
+}
 export function programPath(ast) {
   let program;
   traverse(ast, {
@@ -38,11 +45,20 @@ export function forEachScope(program, fn) {
 }
 
 /**
- * Program-scope bindings are script globals that other scripts may use, so passes only delete
- * or rename them when the name is obfuscator-generated.
+ * Script top-level bindings are globals that other scripts may use, so passes only delete or
+ * rename them when the name is obfuscator-generated. Module top-level bindings are private
+ * unless exported.
  */
-export const isPrivateBinding = (binding) =>
-  binding.scope.path.type !== "Program" || isObfuscatorName(binding.identifier.name);
+export const isPrivateBinding = (binding) => {
+  const scope = binding.scope.path;
+  if (scope.type !== "Program") return true;
+  if (isObfuscatorName(binding.identifier.name)) return true;
+  return scope.node.sourceType === "module" && !isExported(binding);
+};
+
+const isExported = (binding) =>
+  binding.referencePaths.some((r) => r.parentPath.isExportSpecifier()) ||
+  Boolean(binding.path.findParent((p) => p.isExportNamedDeclaration() || p.isExportDefaultDeclaration()));
 
 export const isLiteral = (node) =>
   t.isStringLiteral(node) || t.isNumericLiteral(node) || t.isBooleanLiteral(node) || t.isNullLiteral(node);

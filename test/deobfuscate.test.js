@@ -23,6 +23,14 @@ console.log(p.a);`;
   assert.deepEqual(await sandbox.run(await run(input)), ["2"]);
 });
 
+
+test("split proxy object is merged when a method parameter shadows its name", async () => {
+  // Minified obfuscator output reuses `c` for both the object and a parameter.
+  const input = `const c = {}; c.ab = function (W, c) { return W / c; }, c.cd = "x"; const o = c; console.log(o.ab(4, 2), o.cd);`;
+  const out = await run(input);
+  assert.deepEqual(await sandbox.run(out), ["2 x"]);
+  assert.doesNotMatch(out, /\.ab\(/);
+});
 test("unreferenced program-scope declarations with readable names are kept", async () => {
   // Another <script> may call these.
   const out = await run("function helper() {} var config = 1;");
@@ -36,9 +44,15 @@ for (let _0x1a = 0; _0x1a < 2; _0x1a++) console.log(index + _0x1a);`;
   assert.deepEqual(await sandbox.run(await run(input)), ["10", "11"]);
 });
 
+test("renaming leaves labels alone when a binding shares their name", async () => {
+  const input = `function f(){ for (const e of [1]) { e: for (const x of [2]) { continue e; } } return 1; }
+console.log(f());`;
+  assert.deepEqual(await sandbox.run(await run(input)), ["1"]);
+});
+
 test("a decoder call that throws is left in place with its machinery", async () => {
   const input = `function _0xa() { const k = ["log"]; _0xa = function () { return k; }; return _0xa(); }
-function _0xb(i) { if (i > 5) throw new Error("x"); return _0xa()[i]; }
+function _0xb(i) { i = i - 0; if (i > 5) throw new Error("x"); return _0xa()[i]; }
 console[_0xb(0)]("ok");
 try { _0xb(9); } catch (e) { console.log("caught"); }`;
   const out = await run(input);
@@ -48,7 +62,7 @@ try { _0xb(9); } catch (e) { console.log("caught"); }`;
 
 test("runaway decoder in the sandbox times out instead of hanging", async () => {
   const input = `function _0xa() { const k = ["log"]; _0xa = function () { return k; }; return _0xa(); }
-function _0xb(i) { while (i === 7) {} return _0xa()[i]; }
+function _0xb(i) { i = i - 0; while (i === 7) {} return _0xa()[i]; }
 console[_0xb(0)]("x");
 if (typeof window !== "undefined") _0xb(7);`;
   const slow = new Sandbox({ timeout: 200 });

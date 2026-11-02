@@ -1,56 +1,79 @@
-import { t, generate, isConstExpr, cloneReplacing } from "../ast.js";
+import { t, generateCompact as generate, isConstExpr, cloneReplacing } from "../ast.js";
 import { removeDeadBindings } from "./cleanup.js";
 
 /**
- * Decodes obfuscator.io string arrays: finds the array source, its decoder functions and the
+ * Decodes obfuscator.io string arrays: finds each array source, its decoder functions and the
  * rotation IIFE, runs them in the sandbox, and replaces every decoder call with its string.
- * Wrapper functions and aliases around the decoder are resolved statically first.
- * Only removes the machinery when every call site decoded.
+ * Wrapper functions and aliases around the decoders are resolved statically first.
+ * A group's machinery is removed only when nothing outside it still references it.
+ * All groups share one program traversal and one dead-code sweep, so bundles with
+ * hundreds of arrays stay linear in size.
  */
 export async function decodeStringArrays(program, sandbox) {
   program.scope.crawl();
   const top = program.get("body");
-  let changed = false;
-
+  const groups = [];
+  const byDecoder = new Map();
+  const machineryNodes = new Set();
   for (const source of findArraySources(top)) {
-    const decoders = top.filter(
-      (s) => s.isFunctionDeclaration() && s !== source.path && referencesBinding(s, source.binding),
-    );
+    const users = topLevelUsers(source.binding, source.path);
+    const decoders = users.filter((s) => isDecoder(s, source.binding));
     if (decoders.length === 0) continue;
-    const decoderBindings = new Set(decoders.map((d) => program.scope.getBinding(d.node.id.name)));
-    const rotations = top.filter((s) => isRotation(s, source.binding));
+    const rotations = users.filter((s) => isRotation(s, source.binding));
+    // Every other top-level user of the array must be a decoder or the rotation. An unrecognized
+    // user may reorder the array (a rotation we missed), and decoding without it yields garbage.
+    if (users.some((u) => !decoders.includes(u) && !rotations.includes(u))) continue;
+    const group = { source, decoders, rotations, sites: [] };
+    group.machinery = [source.path, ...group.decoders, ...group.rotations];
+    for (const p of group.machinery) machineryNodes.add(p.node);
+    for (const d of decoders) byDecoder.set(program.scope.getBinding(d.node.id.name), group);
+    groups.push(group);
+  }
+  if (groups.length === 0) return false;
 
-    const sites = [];
-    program.traverse({
-      CallExpression(path) {
-        if (insideAny(path, [source.path, ...decoders, ...rotations])) return;
-        const call = resolveCall(path.node, path.scope, decoderBindings, 0);
-        if (call) sites.push({ path, code: generate(call) });
-      },
+  const decoderBindings = new Set(byDecoder.keys());
+  program.traverse({
+    enter(path) {
+      if (machineryNodes.has(path.node)) path.skip();
+    },
+    CallExpression(path) {
+      const call = resolveCall(path.node, path.scope, decoderBindings, 0);
+      if (!call) return;
+      const group = byDecoder.get(program.scope.getBinding(call.callee.name));
+      group.sites.push({ path, code: generate(call) });
+    },
+  });
+
+  // Groups are independent: send them all at once so the sandbox pool runs them in parallel.
+  // Replacements are applied after every batch returns, so no AST change races a traversal.
+  const active = groups.filter((g) => g.sites.length > 0);
+  const outcomes = await Promise.all(
+    active.map((group) => {
+      const setup = group.machinery.map((p) => generate(p.node)).join("\n");
+      return sandbox.decode(setup, group.sites.map((s) => s.code)).catch(() => null);
+    }),
+  );
+  let changed = false;
+  active.forEach((group, g) => {
+    const results = outcomes[g];
+    if (!results) return;
+    group.sites.forEach((site, i) => {
+      if (results[i] == null) return;
+      site.path.replaceWith(t.stringLiteral(results[i]));
+      changed = true;
     });
-    if (sites.length > 0) {
-      const setup = [source.path, ...rotations, ...decoders].map((p) => generate(p.node)).join("\n");
-      let results;
-      try {
-        results = await sandbox.decode(setup, sites.map((s) => s.code));
-      } catch {
-        continue;
-      }
-      sites.forEach((site, i) => {
-        if (results[i] != null) site.path.replaceWith(t.stringLiteral(results[i]));
-      });
-      changed = true;
-    }
-    // Aliases of the decoder are now dead; drop them before checking for remaining uses.
-    removeDeadBindings(program);
-    const machinery = [source.path, ...decoders, ...rotations].filter((p) => !p.removed);
-    // removeDeadBindings re-crawled the scope, so look the bindings up again.
-    const names = [...decoderBindings, source.binding].map((b) => b.identifier.name);
+  });
+
+  // Aliases of the decoders are now dead; drop them before checking for remaining uses.
+  if (removeDeadBindings(program)) changed = true;
+  for (const group of groups) {
+    const machinery = group.machinery.filter((p) => !p.removed);
+    // removeDeadBindings re-crawled the scope, so look the bindings up again by name.
+    const names = [group.source.binding, ...group.decoders.map((d) => ({ identifier: d.node.id }))].map((b) => b.identifier.name);
     const used = names.some((n) => program.scope.getBinding(n)?.referencePaths.some((r) => !insideAny(r, machinery)));
-    if (!used) {
-      for (const p of machinery) p.remove();
-      changed = true;
-    }
+    if (used) continue;
+    for (const p of machinery) p.remove();
+    changed = true;
   }
   return changed;
 }
@@ -65,9 +88,11 @@ function findArraySources(top) {
       const hasArray = body.some(
         (s) => t.isVariableDeclaration(s) && s.declarations.some((d) => isStringArray(d.init)),
       );
-      const reassignsSelf = body.some(
-        (s) => t.isExpressionStatement(s) && t.isAssignmentExpression(s.expression) && t.isIdentifier(s.expression.left, { name }),
-      );
+      // `A = function(){…}; return A();` or minified `return (A = function(){…})();`
+      const reassignsSelf = body.some((s) => {
+        const e = t.isExpressionStatement(s) ? s.expression : t.isReturnStatement(s) && t.isCallExpression(s.argument) ? s.argument.callee : null;
+        return t.isAssignmentExpression(e) && t.isIdentifier(e.left, { name });
+      });
       if (hasArray && reassignsSelf) out.push({ path, binding: path.scope.parent.getBinding(name) });
     } else if (path.isVariableDeclaration() && path.node.declarations.length === 1) {
       const decl = path.node.declarations[0];
@@ -86,16 +111,45 @@ function referencesBinding(path, binding) {
   return binding.referencePaths.some((r) => r.isDescendant(path));
 }
 
-/** `(function(arr, n){ … })(A, 0x1234)`, possibly behind `!`. */
+/** Distinct top-level statements (other than `self`) containing a reference to `binding`. */
+function topLevelUsers(binding, self) {
+  const users = new Set();
+  for (const ref of binding.referencePaths) {
+    let p = ref;
+    while (p.parentPath && !p.parentPath.isProgram()) p = p.parentPath;
+    if (p !== self && p.node !== self.node) users.add(p);
+  }
+  return [...users];
+}
+
+/**
+ * obfuscator.io decoder: a function declaration whose body starts by shifting its first param
+ * (`i = i - 0x1e3` or `i -= 399`) and then indexes the array returned by `A()` or `A`.
+ * Ordinary code that merely reads a string-array constant fails this shape.
+ */
+function isDecoder(path, binding) {
+  if (!path.isFunctionDeclaration() || path.node.params.length < 1 || !t.isIdentifier(path.node.params[0])) return false;
+  const [first] = path.node.body.body;
+  const index = path.node.params[0].name;
+  const e = t.isExpressionStatement(first) ? first.expression : null;
+  if (!t.isAssignmentExpression(e) || !t.isIdentifier(e.left, { name: index })) return false;
+  if (e.operator === "=" && !(t.isBinaryExpression(e.right, { operator: "-" }) && t.isIdentifier(e.right.left, { name: index }))) return false;
+  if (e.operator !== "=" && e.operator !== "-=") return false;
+  return path.node.body.body.length <= 12 && referencesBinding(path, binding);
+}
+
+/**
+ * The rotation IIFE: `(function(arr, n){ … })(A, 0x1234)` or the minified
+ * `!function(){ const c = A(); for(;;) try{ … c.push(c.shift()) … } }()`, possibly behind `!`.
+ */
 function isRotation(path, binding) {
   if (!path.isExpressionStatement()) return false;
   let expr = path.node.expression;
   if (t.isUnaryExpression(expr)) expr = expr.argument;
-  return (
-    t.isCallExpression(expr) &&
-    (t.isFunctionExpression(expr.callee) || t.isArrowFunctionExpression(expr.callee)) &&
-    expr.arguments.some((a) => t.isIdentifier(a, { name: binding.identifier.name }))
-  );
+  if (!t.isCallExpression(expr) || !(t.isFunctionExpression(expr.callee) || t.isArrowFunctionExpression(expr.callee))) return false;
+  if (expr.arguments.some((a) => t.isIdentifier(a, { name: binding.identifier.name }))) return true;
+  // Only reached for top-level IIFEs that reference the array, so generating them is cheap.
+  return referencesBinding(path, binding) && /\.push\(\w+\.shift\(\)\)|\["push"\]\(\w+\["shift"\]\(\)\)/.test(generate(path.node));
 }
 
 const insideAny = (path, containers) => containers.some((c) => path === c || path.isDescendant(c));

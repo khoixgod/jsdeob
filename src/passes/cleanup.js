@@ -1,26 +1,50 @@
 import { t, isPure, isPrivateBinding, isLiteral, memberKey, forEachScope } from "../ast.js";
 
 /**
- * Deletes unreferenced private bindings whose initializer has no side effects, repeating until
- * nothing changes. Program-scope names are kept unless obfuscator-generated (they may be globals).
+ * Deletes unreferenced private bindings whose initializer has no side effects. Program-scope
+ * names in scripts are kept unless obfuscator-generated (they may be globals).
+ *
+ * One crawl, then a worklist: deleting a declaration only re-checks the bindings its code
+ * referenced, instead of re-crawling the program until nothing changes.
  */
 export function removeDeadBindings(program) {
+  program.scope.crawl();
+  const queue = [];
+  forEachScope(program, (scope) => {
+    for (const binding of Object.values(scope.bindings)) queue.push(binding);
+  });
+  const removedRefs = new Set();
+  const liveRefs = (binding) => binding.referencePaths.filter((r) => !removedRefs.has(r.node) && !isInsideRemoved(r));
   let changed = false;
-  for (let again = true; again; ) {
-    again = false;
-    program.scope.crawl();
-    forEachScope(program, (scope) => {
-      for (const binding of Object.values(scope.bindings)) {
-        if (binding.referenced || !isPrivateBinding(binding)) continue;
-        if (binding.constantViolations.length > 0 && !binding.constantViolations.every(isRemovableAssignment)) continue;
-        if (!removeDeclaration(binding)) continue;
-        for (const v of binding.constantViolations) removeAssignment(v);
-        again = changed = true;
-      }
-    });
+  while (queue.length) {
+    const binding = queue.pop();
+    if (binding.path.removed || !isPrivateBinding(binding) || liveRefs(binding).length > 0) continue;
+    if (binding.constantViolations.some((v) => !v.removed && !isInsideRemoved(v) && !isRemovableAssignment(v))) continue;
+    // Collect what the doomed code references, so those bindings get re-checked.
+    const doomed = [binding.path, ...binding.constantViolations.filter((v) => !v.removed).map((v) => v.parentPath)];
+    const touched = [];
+    for (const d of doomed) {
+      d.traverse({
+        ReferencedIdentifier(p) {
+          removedRefs.add(p.node);
+          const b = p.scope.getBinding(p.node.name);
+          if (b) touched.push(b);
+        },
+      });
+    }
+    if (!removeDeclaration(binding)) {
+      for (const d of doomed) d.traverse({ ReferencedIdentifier: (p) => void removedRefs.delete(p.node) });
+      continue;
+    }
+    for (const v of binding.constantViolations) removeAssignment(v);
+    queue.push(...touched);
+    changed = true;
   }
+  if (changed) program.scope.crawl();
   return changed;
 }
+
+const isInsideRemoved = (path) => Boolean(path.find((p) => p.removed));
 
 function removeDeclaration(binding) {
   const p = binding.path;

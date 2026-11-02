@@ -4,6 +4,10 @@
   "description": "JavaScript deobfuscator for javascript-obfuscator (obfuscator.io) output",
   "type": "module",
   "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./src/pool.js": "./src/pool.js"
+  },
   "bin": {
     "jsdeob": "bin/jsdeob.js"
   },

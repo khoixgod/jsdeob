@@ -18,6 +18,9 @@ export async function deobfuscate(code, { sandbox, rename = true } = {}) {
   try {
     const ast = parse(code);
     const program = programPath(ast);
+    // Minifiers glue the string array rotation IIFE onto other calls (`a(), function(){…}()`);
+    // splitting first lets decodeStringArrays find it as its own statement.
+    splitSequences(program);
     for (let round = 0; round < MAX_ROUNDS; round++) {
       let changed = false;
       changed = foldConstants(program) || changed;

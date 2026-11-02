@@ -1,14 +1,15 @@
 // Runs jsdeob over a devirt-corpus checkout and checks each output against the input:
 // both run in the sandbox, and their console output must match exactly.
-// usage: node scripts/corpus.js <corpus-dir> [--filter substring] [--show N]
+// usage: node scripts/corpus.js <corpus-dir> [--filter substring] [--show N] [-j threads]
 import { readFile, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { parseArgs } from "node:util";
-import { deobfuscate, Sandbox } from "../src/index.js";
+import { Sandbox } from "../src/index.js";
+import { DeobfuscatorPool } from "../src/pool.js";
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
-  options: { filter: { type: "string" }, show: { type: "string", default: "3" } },
+  options: { filter: { type: "string" }, show: { type: "string", default: "3" }, jobs: { type: "string", short: "j" } },
 });
 const root = positionals[0];
 if (!root) {
@@ -42,38 +43,44 @@ function opaquePct(code) {
   return (100 * names.filter((n) => /^_0x[0-9a-f]+$/i.test(n) || n.length <= 2).length) / names.length;
 }
 
+// Deobfuscation runs on worker threads; the equivalence check runs both versions in a
+// separate sandbox pool on this thread.
+const pool = new DeobfuscatorPool(values.jobs ? { threads: Number(values.jobs) } : {});
 const sandbox = new Sandbox();
 const stats = new Map();
 const failures = [];
 const started = Date.now();
-for (const file of selected) {
-  const rel = relative(root, file).replaceAll("\\", "/");
-  const source = rel.split("/").slice(0, 2).join("/");
-  const s = stats.get(source) ?? { n: 0, ok: 0, kept: 0, opaque: 0, devirtOpaque: 0, devirtKept: 0 };
-  stats.set(source, s);
-  s.n++;
-  const input = await readFile(file, "utf8");
-  let output;
-  let verdict;
-  try {
-    output = await deobfuscate(input, { sandbox });
-    const [before, after] = [await sandbox.run(input), await sandbox.run(output)];
-    verdict = JSON.stringify(before) === JSON.stringify(after) ? null : `behavior: ${JSON.stringify(before).slice(0, 200)} vs ${JSON.stringify(after).slice(0, 200)}`;
-  } catch (e) {
-    verdict = `error: ${e.message}`;
-  }
-  if (verdict) failures.push({ rel, verdict });
-  else s.ok++;
-  if (output) {
-    s.kept += (100 * output.length) / input.length;
-    s.opaque += opaquePct(output);
-  }
-  const d = devirt.get(rel);
-  if (d) {
-    s.devirtOpaque += d.opaque_out;
-    s.devirtKept += d.kept_pct;
-  }
-}
+await Promise.all(
+  selected.map(async (file) => {
+    const rel = relative(root, file).replaceAll("\\", "/");
+    const source = rel.split("/").slice(0, 2).join("/");
+    const s = stats.get(source) ?? { n: 0, ok: 0, kept: 0, opaque: 0, devirtOpaque: 0, devirtKept: 0 };
+    stats.set(source, s);
+    s.n++;
+    const input = await readFile(file, "utf8");
+    let output;
+    let verdict;
+    try {
+      output = await pool.deobfuscate(input);
+      const [before, after] = await Promise.all([sandbox.run(input), sandbox.run(output)]);
+      verdict = JSON.stringify(before) === JSON.stringify(after) ? null : `behavior: ${JSON.stringify(before).slice(0, 200)} vs ${JSON.stringify(after).slice(0, 200)}`;
+    } catch (e) {
+      verdict = `error: ${e.message}`;
+    }
+    if (verdict) failures.push({ rel, verdict });
+    else s.ok++;
+    if (output) {
+      s.kept += (100 * output.length) / input.length;
+      s.opaque += opaquePct(output);
+    }
+    const d = devirt.get(rel);
+    if (d) {
+      s.devirtOpaque += d.opaque_out;
+      s.devirtKept += d.kept_pct;
+    }
+  }),
+);
+await pool.close();
 sandbox.close();
 
 const rows = [...stats].sort(([a], [b]) => a.localeCompare(b));

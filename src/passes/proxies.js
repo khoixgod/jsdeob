@@ -12,14 +12,16 @@ export function mergeObjectAssignments(program) {
       if (!t.isIdentifier(id) || !t.isObjectExpression(init) || init.properties.length > 0) return;
       const decl = path.parentPath;
       if (decl.node.declarations.at(-1) !== path.node || !(decl.parentPath.isProgram() || decl.parentPath.isBlockStatement())) return;
+      const binding = path.scope.getBinding(id.name);
+      if (!binding) return;
       const seen = new Set();
       let next = decl.getSibling(decl.key + 1);
       while (next.node) {
-        const exprs = statementAssignments(next.node);
+        const exprs = statementAssignments(next);
         if (!exprs) break;
         const props = [];
         for (const e of exprs) {
-          const prop = assignmentProperty(e, id.name, seen);
+          const prop = assignmentProperty(e, binding, seen);
           if (!prop) break;
           props.push(prop);
         }
@@ -37,28 +39,36 @@ export function mergeObjectAssignments(program) {
 }
 
 function statementAssignments(stmt) {
-  if (!t.isExpressionStatement(stmt)) return null;
-  const e = stmt.expression;
-  return t.isSequenceExpression(e) ? e.expressions : [e];
+  if (!stmt.isExpressionStatement()) return null;
+  const e = stmt.get("expression");
+  return e.isSequenceExpression() ? e.get("expressions") : [e];
 }
 
-function assignmentProperty(expr, name, seen) {
-  if (!t.isAssignmentExpression(expr, { operator: "=" })) return null;
-  const { left, right } = expr;
-  if (!t.isMemberExpression(left) || !t.isIdentifier(left.object, { name })) return null;
+function assignmentProperty(expr, binding, seen) {
+  if (!expr.isAssignmentExpression({ operator: "=" })) return null;
+  const { left, right } = expr.node;
+  if (!t.isMemberExpression(left) || !t.isIdentifier(left.object, { name: binding.identifier.name })) return null;
+  if (expr.scope.getBinding(left.object.name) !== binding) return null;
   const key = memberKey(left);
   if (key === null || seen.has(key)) return null;
-  // The value must not read the object being built (it isn't complete yet).
-  if (mentions(right, name)) return null;
+  // The value must not read the object being built (it isn't complete yet). Scope-aware:
+  // obfuscators reuse the object's name for parameters, which don't count.
+  if (readsBinding(expr.get("right"), binding)) return null;
   seen.add(key);
   return t.objectProperty(t.isValidIdentifier(key, false) ? t.identifier(key) : t.stringLiteral(key), right);
 }
 
-function mentions(node, name) {
-  if (!node || typeof node !== "object") return false;
-  if (Array.isArray(node)) return node.some((n) => mentions(n, name));
-  if (t.isIdentifier(node, { name })) return true;
-  return (t.VISITOR_KEYS[node.type] ?? []).some((k) => mentions(node[k], name));
+function readsBinding(path, binding) {
+  let found = path.isIdentifier() && path.scope.getBinding(path.node.name) === binding;
+  path.traverse({
+    ReferencedIdentifier(p) {
+      if (p.scope.getBinding(p.node.name) === binding) {
+        found = true;
+        p.stop();
+      }
+    },
+  });
+  return found;
 }
 
 /**

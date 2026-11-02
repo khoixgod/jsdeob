@@ -1,4 +1,4 @@
-import { t, isObfuscatorName, forEachScope } from "../ast.js";
+import { t, isObfuscatorName, isPrivateBinding, forEachScope } from "../ast.js";
 
 /**
  * Renames obfuscator-generated (`_0x…`) bindings to role-based names: loop counters become
@@ -23,17 +23,45 @@ export function renameIdentifiers(program) {
     }
   };
 
-  let changed = false;
+  // Decide every new name first, then rewrite in one traversal. `scope.rename` walks the
+  // whole scope block per call, which is quadratic on large bundles.
+  const plan = new Map();
   forEachScope(program, (scope) => {
-    const isProgram = scope.path.isProgram();
     for (const [name, binding] of Object.entries(scope.bindings)) {
-      // Short names come from mangling; at program scope they may be globals other scripts use.
-      if (!isObfuscatorName(name) && (isProgram || name.length > 2)) continue;
-      scope.rename(name, fresh(roleOf(binding)));
-      changed = true;
+      // `_0x…` names always; 1–2 character names come from mangling.
+      if (!isObfuscatorName(name) && name.length > 2) continue;
+      if (!isPrivateBinding(binding) || binding.kind === "module") continue;
+      plan.set(binding, { from: name, to: fresh(roleOf(binding)) });
     }
   });
-  return changed;
+  if (plan.size === 0) return false;
+
+  program.traverse({
+    Identifier(path) {
+      const { node, parent } = path;
+      // Labels live in their own namespace (`e: for…; continue e`).
+      if (t.isLabeledStatement(parent) || t.isBreakStatement(parent) || t.isContinueStatement(parent)) return;
+      // Scope tables still hold the old names until the crawl below.
+      const binding = path.scope.getBinding(node.name);
+      const entry = binding && plan.get(binding);
+      if (!entry || node.name !== entry.from) return;
+      if (!path.isReferencedIdentifier() && !path.isBindingIdentifier() && !isWriteTarget(path)) return;
+      // `{ a }` / `const { a } = o`: the key keeps the old name, only the value is renamed.
+      if (t.isObjectProperty(parent) && parent.shorthand && parent.value === node) {
+        parent.shorthand = false;
+        parent.key = t.identifier(entry.from);
+      }
+      node.name = entry.to;
+    },
+  });
+  program.scope.crawl();
+  return true;
+}
+
+/** `x = …`, `x++`, `[x] = …`, `for (x of …)`: identifiers Babel marks neither referenced nor binding. */
+function isWriteTarget(path) {
+  const p = path.parentPath;
+  return p.isAssignmentExpression({ left: path.node }) || p.isUpdateExpression() || p.isArrayPattern() || p.isRestElement() || p.isAssignmentPattern({ left: path.node }) || (p.isObjectProperty({ value: path.node }) && p.parentPath.isObjectPattern()) || p.isForXStatement({ left: path.node });
 }
 
 function roleOf(binding) {

@@ -4,16 +4,37 @@ Deobfuscator for [javascript-obfuscator](https://github.com/javascript-obfuscato
 
 ```
 npx jsdeob input.js -o output.js
-npx jsdeob - < input.js          # stdin to stdout
-npx jsdeob input.js --no-rename  # keep original identifiers
+npx jsdeob - < input.js                  # stdin to stdout
+npx jsdeob input.js --no-rename          # keep original identifiers
+npx jsdeob a.js b.js c.js --out-dir out  # many files, in parallel (-j N threads)
 ```
 
 ```js
 import { deobfuscate } from "jsdeob";
 const clean = await deobfuscate(code);
+
+import { DeobfuscatorPool } from "jsdeob/src/pool.js";
+const pool = new DeobfuscatorPool();            // cores - 1 worker threads
+const outputs = await Promise.all(files.map((code) => pool.deobfuscate(code)));
+await pool.close();
 ```
 
 Requires Node 22+.
+
+## Performance
+
+There are two levels of parallelism:
+
+- **Across files**, worker threads each deobfuscate one file. A Babel AST can't be shared between threads, so one file is the unit of work.
+- **Within a file**, each string array group is an independent sandbox batch. The groups go out at once to a pool of sandbox processes.
+
+Every pass is linear in file size. Renaming plans all new names and then rewrites them in one traversal. Dead-code removal uses a worklist instead of re-crawling scopes. String decoding scans the program once for all groups.
+
+| workload | before | after |
+|---|---|---|
+| devirt-corpus, 9,514 files | 102 s | 19 s |
+| afterlife.rest, 7 files / 4.6 MB | 175 s | 32 s |
+| largest single file (3.2 MB, 155 string groups) | 81 s | 32 s |
 
 ## Passes
 
@@ -27,11 +48,11 @@ Each round runs these passes in order, until a round changes nothing:
 
 Afterwards it splits sequence expressions and multi-declarations, converts `a["b"]` to `a.b` and hex literals to decimal, and renames `_0x…` and 1–2 character local names by role (`index`, `acc`, `item`, `arr`, `str`, …).
 
-Program-scope names that look human-written are never deleted or renamed, because another script on the page may use them.
+Script top-level names that look human-written are never deleted or renamed, because another script on the page may use them. In ES modules, top-level names are private unless exported.
 
 ## Sandbox
 
-Decoders run in `node:vm` inside a child process started with `node --permission`. The child can read only its own file, and it has no network, filesystem write or subprocess access. Each evaluation has a 2 s vm timeout. A watchdog kills and respawns the child if it hangs. When a call fails or times out, that call site is left as it was.
+Decoders run in `node:vm` inside child processes started with `node --permission`. A child can read only its own file, and it has no network, filesystem write or subprocess access. Each evaluation has a 2 s vm timeout. A watchdog kills and respawns a child if it hangs. When a call fails or times out, that call site is left as it was. The sandbox gets compact code, because javascript-obfuscator's `selfDefending` option makes a decoder loop forever when its own source has been reformatted.
 
 ## Corpus results
 
@@ -48,4 +69,6 @@ devirt evaluates whole programs down to their output (`console.log(7714)`). jsde
 
 - No switch-dispatcher control-flow unflattening (`while(true){switch(order[i++]){…}}`). The corpus contains none.
 - Proxy functions with repeated or reordered parameters stay as method calls.
+- A string group whose array is read by anything other than its decoders and rotation loop is skipped. Decoding it before an unrecognized rotation would produce garbage.
+- `selfDefending` and `disableConsoleOutput` wrappers are kept. They change runtime behavior, so removing them would change what the program does.
 - The renamer works from roles, not meaning. Names like `value3` are left where it cannot infer a role.

@@ -9,12 +9,17 @@ function handle({ op, setup, calls, code, timeout }) {
   if (op === "decode") {
     const ctx = vm.createContext({}, { microtaskMode: "afterEvaluate" });
     vm.runInContext(setup, ctx, opts);
+    // One timeout means the decoder hangs (e.g. a tripped self-defense check); the remaining
+    // calls would each burn the full timeout too, so give up on the batch.
+    let hung = false;
     return {
       results: calls.map((call) => {
+        if (hung) return null;
         try {
           const value = vm.runInContext(call, ctx, opts);
           return typeof value === "string" ? value : null;
-        } catch {
+        } catch (e) {
+          if (e && e.code === "ERR_SCRIPT_EXECUTION_TIMEOUT") hung = true;
           return null;
         }
       }),
