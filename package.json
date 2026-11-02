@@ -1,0 +1,24 @@
+{
+  "name": "jsdeob",
+  "version": "0.1.0",
+  "description": "JavaScript deobfuscator for javascript-obfuscator (obfuscator.io) output",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "jsdeob": "bin/jsdeob.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "corpus": "node scripts/corpus.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@babel/generator": "^8.0.10",
+    "@babel/parser": "^8.0.10",
+    "@babel/traverse": "^8.0.10",
+    "@babel/types": "^8.0.10"
+  }
+}
